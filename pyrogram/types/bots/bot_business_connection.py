@@ -61,7 +61,7 @@ class BotBusinessConnection(Object):
         return BotBusinessConnection(
             bot_connection_id=bot_connection.connection_id,
             user=cast(
-                pyrogram.types.User, await client.get_users(bot_connection.user_id)
+                "pyrogram.types.User", await client.get_users(bot_connection.user_id)
             ),
             dc_id=bot_connection.dc_id,
             date=utils.timestamp_to_datetime(bot_connection.date),

@@ -89,7 +89,7 @@ class CallbackQuery(Object, Update):
 
             if not message:
                 message = cast(
-                    types.Message, await client.get_messages(chat_id, message_id)
+                    "types.Message", await client.get_messages(chat_id, message_id)
                 )
         elif isinstance(callback_query, raw.types.UpdateInlineBotCallbackQuery):
             inline_message_id = utils.pack_inline_message_id(callback_query.msg_id)

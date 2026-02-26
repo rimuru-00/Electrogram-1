@@ -60,10 +60,10 @@ class MessageStory(Object):
             sender_chat = types.Chat._parse_chat(client, chat.chats[0])
         else:
             user_id = message_story.peer.user_id
-            from_user = cast(types.User, await client.get_users(user_id))
+            from_user = cast("types.User", await client.get_users(user_id))
         if not client.me.is_bot:
             return await client.get_stories(
-                cast(int, user_id or chat_id), message_story.id
+                cast("int", user_id or chat_id), message_story.id
             )
         return MessageStory(
             from_user=from_user,

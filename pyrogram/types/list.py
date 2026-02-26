@@ -9,7 +9,7 @@ class List(list):
     __slots__ = []
 
     def __str__(self) -> str:
-        return Object.__str__(cast(Object, self))
+        return Object.__str__(cast("Object", self))
 
     def __repr__(self) -> str:
         return f"pyrogram.types.List([{','.join(repr(i) for i in self)}])"
