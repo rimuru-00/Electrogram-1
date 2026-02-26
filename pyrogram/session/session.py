@@ -52,6 +52,7 @@ class Session:
     STORED_MSG_IDS_MAX_SIZE = 1000 * 2
     RECONNECT_THRESHOLD = 13
     RE_START_RANGE = range(4)
+    IS_STARTED_TIMEOUT = 120
 
     # Maximum seconds to wait between backoff reconnect attempts.
     # After RE_START_RANGE fast attempts fail, delays go:
@@ -651,7 +652,28 @@ class Session:
                 return None
 
             if not self.is_started.is_set():
-                await self.is_started.wait()
+                # If restart() is stuck and never sets is_started, a bare
+                # wait() hangs forever — killing the bot silently. Instead,
+                # we wait up to 60s and then raise a clear error so the
+                # caller can handle it rather than freezing indefinitely.
+                try:
+                    await asyncio.wait_for(
+                        self.is_started.wait(),
+                        timeout=self.IS_STARTED_TIMEOUT,
+                    )
+                except asyncio.TimeoutError:
+                    log.error(
+                        "[%s] Session DC%s did not recover within %s(s) "
+                        "— aborting invoke() for \"%s\"",
+                        self.client.name,
+                        self.dc_id,
+                        self.IS_STARTED_TIMEOUT,
+                        query_name,
+                    )
+                    raise asyncio.TimeoutError(
+                        f"Session DC{self.dc_id} did not recover within {self.IS_STARTED_TIMEOUT}s "
+                        f"for \"{query_name}\""
+                    )
 
             try:
                 return await self.send(query, timeout=timeout)
