@@ -51,6 +51,16 @@ class Session:
     RECONNECT_THRESHOLD = 13
     RE_START_RANGE = range(4)
 
+    # Maximum seconds to wait between backoff reconnect attempts.
+    # After RE_START_RANGE fast attempts fail, delays go:
+    # 2s → 4s → 8s → 16s → 32s → 60s (capped here forever until connected).
+    MAX_RECONNECT_DELAY = 60
+
+    # Dead session detector: if invoke() is waiting for is_started to be set
+    # for longer than this, restart() is clearly stuck. Raise a clear error
+    # instead of hanging the caller forever (which was the original stuck bug).
+    IS_STARTED_WAIT_TIMEOUT = 60
+
     TRANSPORT_ERRORS: ClassVar[dict[int, str]] = {
         404: "auth key not found",
         429: "transport flood",
@@ -218,6 +228,17 @@ class Session:
                 self.instant_stop = False
 
     async def restart(self) -> None:
+        """
+        THE FIX: This method previously tried RE_START_RANGE (4 attempts) then
+        silently returned — leaving is_started unset forever. Every pending
+        invoke() would then hang at `await self.is_started.wait()` with no way
+        out, making the bot appear dead while the Heroku dyno stayed running.
+
+        Now: after the 4 fast attempts fail, we enter an infinite exponential
+        backoff loop (2s → 4s → 8s … capped at MAX_RECONNECT_DELAY=60s).
+        The bot will self-recover no matter how long the network outage lasts.
+        Only AuthKeyDuplicated / Unauthorized are treated as unrecoverable.
+        """
         if self.currently_restarting:
             return
         if self.instant_stop:
@@ -225,6 +246,8 @@ class Session:
 
         try:
             self.currently_restarting = True
+
+            # Rate-limit overly frequent reconnects
             now = time()
             if (
                 self.last_reconnect_attempt
@@ -242,36 +265,117 @@ class Session:
 
             self.last_reconnect_attempt = time()
             await self.stop(restart=True)
+
+            # ── Phase 1: fast attempts (original behaviour) ──────────────────
+            connected = False
             for try_ in self.RE_START_RANGE:
+                if self.instant_stop:
+                    return
                 try:
                     await self.start()
+                    connected = True
                     break
+                except (AuthKeyDuplicated, Unauthorized) as e:
+                    # Unrecoverable — propagate immediately
+                    log.error(
+                        "Client [%s] unrecoverable auth error during restart: %s",
+                        self.client.name,
+                        e,
+                    )
+                    raise
                 except ValueError as e:
+                    # SQLite / storage error — try reloading the session DB
                     try:
                         await self.client.load_session()
                         log.info(
-                            "Client [%s] re-starting got SQLite error, connected to DB successfully. try %s; exc: %s %s",
+                            "Client [%s] re-starting got SQLite error, connected to DB. "
+                            "try %s; exc: %s %s",
                             self.client.name,
                             try_,
                             type(e).__name__,
                             e,
                         )
-                    except Exception as e:
+                    except Exception as load_e:
                         log.warning(
-                            "Client [%s] failed re-starting SQLite DB, try %s; exc: %s %s",
+                            "Client [%s] failed re-loading SQLite DB, try %s; exc: %s %s",
                             self.client.name,
                             try_,
-                            type(e).__name__,
-                            e,
+                            type(load_e).__name__,
+                            load_e,
                         )
                 except Exception as e:
                     log.warning(
-                        "Client [%s] failed re-starting, try %s; exc: %s %s",
+                        "Client [%s] restart fast-attempt %s failed: %s %s",
                         self.client.name,
                         try_,
                         type(e).__name__,
                         e,
                     )
+
+            if connected:
+                return
+
+            # ── Phase 2: infinite backoff — never give up ─────────────────────
+            # This is what was missing. Previously the function returned here,
+            # leaving is_started unset and the bot permanently stuck.
+            log.warning(
+                "Client [%s] all %s fast reconnect attempts failed. "
+                "Entering persistent reconnect loop (max backoff %ss) ...",
+                self.client.name,
+                len(self.RE_START_RANGE),
+                self.MAX_RECONNECT_DELAY,
+            )
+
+            backoff = 0
+            while not self.instant_stop:
+                delay = min(2 ** backoff, self.MAX_RECONNECT_DELAY)
+                log.info(
+                    "Client [%s] backoff attempt %s — waiting %ss before retrying",
+                    self.client.name,
+                    backoff + 1,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+
+                if self.instant_stop:
+                    return
+
+                try:
+                    await self.start()
+                    log.info(
+                        "Client [%s] successfully reconnected on backoff attempt %s",
+                        self.client.name,
+                        backoff + 1,
+                    )
+                    return
+                except (AuthKeyDuplicated, Unauthorized) as e:
+                    log.error(
+                        "Client [%s] unrecoverable auth error in backoff loop: %s",
+                        self.client.name,
+                        e,
+                    )
+                    raise
+                except ValueError as e:
+                    with contextlib.suppress(Exception):
+                        await self.client.load_session()
+                    log.warning(
+                        "Client [%s] SQLite error on backoff attempt %s: %s %s",
+                        self.client.name,
+                        backoff + 1,
+                        type(e).__name__,
+                        e,
+                    )
+                except Exception as e:
+                    log.warning(
+                        "Client [%s] backoff attempt %s failed: %s %s",
+                        self.client.name,
+                        backoff + 1,
+                        type(e).__name__,
+                        e,
+                    )
+
+                backoff += 1
+
         finally:
             self.currently_restarting = False
 
@@ -550,7 +654,30 @@ class Session:
                 return None
 
             if not self.is_started.is_set():
-                await self.is_started.wait()
+                # Dead session detector: instead of waiting forever on
+                # is_started, apply a hard timeout. If restart() hasn't
+                # recovered within IS_STARTED_WAIT_TIMEOUT seconds the
+                # session is unrecoverable in its current state — raise a
+                # clear error so the caller can handle it, instead of
+                # silently hanging the entire bot.
+                try:
+                    await asyncio.wait_for(
+                        self.is_started.wait(),
+                        timeout=self.IS_STARTED_WAIT_TIMEOUT,
+                    )
+                except asyncio.TimeoutError:
+                    log.error(
+                        "[%s] Session DC%s did not recover within %ss "
+                        "— aborting invoke() for \"%s\"",
+                        self.client.name,
+                        self.dc_id,
+                        self.IS_STARTED_WAIT_TIMEOUT,
+                        query_name,
+                    )
+                    raise asyncio.TimeoutError(
+                        f"Session DC{self.dc_id} did not recover in time "
+                        f"for request \"{query_name}\""
+                    )
 
             try:
                 return await self.send(query, timeout=timeout)
