@@ -1,3 +1,5 @@
+# pyrogram/client.py
+
 from __future__ import annotations
 
 import asyncio
@@ -1062,7 +1064,7 @@ class Client(Methods):
 
             dc_id = file_id.dc_id
 
-            # â”€â”€ Your session caching logic, preserved exactly â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            # ── Your session caching logic, preserved exactly ────────────────
             try:
                 async with self.media_sessions_lock:
                     session = self.media_sessions.get(dc_id)
@@ -1240,7 +1242,7 @@ class Client(Methods):
                 raise
             except Exception as e:
                 log.exception(e)
-            # NOTE: session is intentionally NOT stopped here â€” it is cached.
+            # NOTE: session is intentionally NOT stopped here — it is cached.
 
     @overload
     def guess_mime_type(self, filename: str) -> str | None: ...
